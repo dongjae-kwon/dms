@@ -1,0 +1,45 @@
+{
+  "roi_top_ratio": 0.48,
+  "roi_bottom_ratio": 0.98,
+  "roi_left_ratio": 0.05,
+  "roi_right_ratio": 0.95,
+  "white_hsv_lower": [
+    0,
+    0,
+    120
+  ],
+  "white_hsv_upper": [
+    180,
+    100,
+    255
+  ],
+  "yellow_hsv_lower": [
+    10,
+    40,
+    50
+  ],
+  "yellow_hsv_upper": [
+    45,
+    255,
+    255
+  ],
+  "gaussian_kernel_size": 7,
+  "canny_low_threshold": 25.0,
+  "canny_high_threshold": 75.0,
+  "hough_rho": 1.0,
+  "hough_theta_deg": 1.0,
+  "hough_threshold": 15,
+  "hough_min_line_length": 15,
+  "hough_max_line_gap": 40,
+  "minimum_absolute_slope": 0.2,
+  "maximum_absolute_slope": 5.0,
+  "lane_width_pixels": 220.0,
+  "lane_width_meters": 0.50,
+  "lookahead_y_ratio": 0.65,
+  "departure_warning_m": 0.12,
+  "departure_stop_m": 0.20,
+  "temporal_alpha": 0.15,
+  "minimum_confidence": 0.2,
+  "capture_frequency_hz": 10.0,
+  "video_fps": 10.0
+}

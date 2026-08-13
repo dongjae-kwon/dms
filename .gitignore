@@ -1,0 +1,60 @@
+# =========================
+# Build
+# =========================
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Executable / binary
+lane_tracker
+*.exe
+*.dll
+*.so
+*.a
+*.o
+*.obj
+
+# =========================
+# Models
+# =========================
+*.onnx
+*.engine
+*.weights
+*.pt
+*.pth
+
+# =========================
+# Video / Image
+# =========================
+*.avi
+*.mp4
+*.mov
+*.mkv
+
+# =========================
+# Debug / Log
+# =========================
+debug_output*.txt
+*.log
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# External resources
+PINTO_model_zoo/
+
+# Calibration / test data
+calib_sample_vid5.txt
+calib_sample_vid5_frame.png
