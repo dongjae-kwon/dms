@@ -20,11 +20,10 @@ struct LaneConfig {
   double minimum_absolute_slope, maximum_absolute_slope;
   double temporal_alpha;
   double minimum_confidence;
-  double max_track_deviation_px = 80.0; // 이전 프레임 위치 기준 이상치 제거 임계값 (기본 80px)
-  double max_color_blob_area_px = 6000.0; // 이보다 큰 흰색/노란색 덩어리는 노면눈부심 등으로 간주하고 제거
-  // 차선 폭 일관성 필터: 기준 폭 대비 허용 오차 비율 (0.20 = ±20%)
-  // 합류/분기 구간에서 새 차선으로 트래커가 점진적으로 튀는 것을 방지
-  double lane_width_tolerance_ratio = 0.20;
+  double max_track_deviation_px = 70.0; // 궤도 복귀 로직을 추가했으므로 기존의 안정적인 70으로 원복
+  double max_color_blob_area_px = 6000.0; // 노면 눈부심, 거대한 횡단보도 등 노이즈 제거용 (이제 실제 작동함)
+  double lane_width_tolerance_px = 80.0; // 한쪽 차선(빨간선)이 초반부터 죽지 않도록 여유 있게 80으로 완화
+  int lane_width_violation_frames = 5; // 깜빡임 방지를 위해 다시 5프레임으로 원복
 };
 
 double calc_x_at_y(double slope, double intercept, double y) {
@@ -56,12 +55,7 @@ bool load_config(const char *filepath, LaneConfig *config) {
   long length = ftell(file);
   fseek(file, 0, SEEK_SET);
   char *buffer = (char *)malloc(length + 1);
-  size_t bytes_read = fread(buffer, 1, length, file);
-  if (bytes_read != (size_t)length) 
-  {
-    fclose(file);
-    return false;
-  }
+  fread(buffer, 1, length, file);
   buffer[length] = '\0';
   fclose(file);
   cJSON *json = cJSON_Parse(buffer);
@@ -103,10 +97,13 @@ bool load_config(const char *filepath, LaneConfig *config) {
   if (track_dev && cJSON_IsNumber(track_dev))
     config->max_track_deviation_px = track_dev->valuedouble;
 
-  // 차선 폭 일관성 필터 허용 오차 (없으면 기본값 0.20 유지)
-  cJSON *width_tol = cJSON_GetObjectItem(json, "lane_width_tolerance_ratio");
+  cJSON *width_tol = cJSON_GetObjectItem(json, "lane_width_tolerance_px");
   if (width_tol && cJSON_IsNumber(width_tol))
-    config->lane_width_tolerance_ratio = width_tol->valuedouble;
+    config->lane_width_tolerance_px = width_tol->valuedouble;
+
+  cJSON *width_viol = cJSON_GetObjectItem(json, "lane_width_violation_frames");
+  if (width_viol && cJSON_IsNumber(width_viol))
+    config->lane_width_violation_frames = width_viol->valueint;
 
   cJSON_Delete(json);
   return true;
@@ -157,14 +154,15 @@ struct ClassicalLaneDetector::Impl {
   int left_coast_count = 0, right_coast_count = 0;
   bool initialized = false;
 
-  // ── 차선 폭 일관성 필터 상태 ──
-  // 두 차선이 모두 안정적일 때 EMA로 학습한 기준 차선 폭(px, lookahead y 기준)
-  double smoothed_lane_width = 0.0;
-  bool lane_width_ready = false; // true가 되면 폭 일관성 필터 활성화
-
   // 디버그용: 가장 최근 프레임에서 쓰인 마스크들 (debug_mask_overlay()에서 사용)
   cv::Mat last_color_mask;
   cv::Mat last_roi_mask;
+
+  // 좌우가 둘 다 신뢰도 높게 잡힐 때만 아주 천천히 갱신되는 "평소 차선폭"
+  // 추정치. 새로 생긴 차선(합류/분기)을 걸러내는 기준으로 씀.
+  double smoothed_lane_width_px = -1.0; // -1이면 아직 추정 전
+  int left_width_violation_count = 0;
+  int right_width_violation_count = 0;
 
   std::string mode_label() const {
     switch (current_mode) {
@@ -325,53 +323,70 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
   if (curr_left.valid) { curr_left.slope = left_m_sum / left_len_sum; curr_left.intercept = left_b_sum / left_len_sum; }
   if (curr_right.valid) { curr_right.slope = right_m_sum / right_len_sum; curr_right.intercept = right_b_sum / right_len_sum; }
 
-  // ── 차선 폭 일관성 필터 ──
-  const double lookahead_y = height * 0.65;
-  const double tol = s.cfg.lane_width_tolerance_ratio;
+  // ── 차선폭 일관성 검사 (합류/분기 구간에서 새로 생긴 차선으로 튀는 것 방지) ──
+  // 한쪽이 이미 신뢰도 높게 추적되고 있고 "평소 차선폭" 추정치가 있으면,
+  // 반대쪽 이번 프레임 후보가 그 폭에서 크게 벗어날 경우 거부. 새로 생긴
+  // 차선은 프레임마다 조금씩만 벌어져서 max_track_deviation_px(직전 프레임
+  // 대비)만으로는 못 걸러내지만, 안정적인 반대쪽 차선 기준으로 보면 폭이
+  // 서서히 정상 범위를 벗어나는 게 드러남.
+  // 원래 0.95(화면 맨 아래)에서 폭을 검사했으나, 커브길에서 직선 근사 오차 때문에
+  // 정상 차선도 폭이 변한 것처럼 착각하여 쳐내는(깜빡임) 문제가 있었습니다.
+  // 이를 화면 중간(0.75)으로 올려서 커브길 오차를 줄이고 깜빡임을 해결합니다.
+  double y_ref = height * 0.75; 
+  bool left_violates = false;
+  bool right_violates = false;
 
-  if (s.lane_width_ready) {
-    const double w_min = s.smoothed_lane_width * (1.0 - tol);
-    const double w_max = s.smoothed_lane_width * (1.0 + tol);
+  if (s.smoothed_lane_width_px > 0) {
+    bool can_check_width = false;
+    double left_x = 0, right_x = 0;
 
-    // 1. 좌우 후보가 모두 있을 때 폭 검사
+    // 1. 양쪽 모두 현재 감지된 선이 있으면 신뢰도와 무관하게 무조건 폭 검사 (한쪽이 갈림길에 고착되는 Hijack 방지)
     if (curr_left.valid && curr_right.valid) {
-      double lx_meas = calc_x_at_y(curr_left.slope, curr_left.intercept, lookahead_y);
-      double rx_meas = calc_x_at_y(curr_right.slope, curr_right.intercept, lookahead_y);
-      double measured_width = rx_meas - lx_meas;
+      left_x = calc_x_at_y(curr_left.slope, curr_left.intercept, y_ref);
+      right_x = calc_x_at_y(curr_right.slope, curr_right.intercept, y_ref);
+      can_check_width = true;
+    } 
+    // 2. 우측만 새로 감지되었고, 좌측은 기존 궤도가 안정적일 때
+    else if (curr_right.valid && s.conf_left >= s.cfg.minimum_confidence) {
+      left_x = calc_x_at_y(s.left.slope, s.left.intercept, y_ref);
+      right_x = calc_x_at_y(curr_right.slope, curr_right.intercept, y_ref);
+      can_check_width = true;
+    }
+    // 3. 좌측만 새로 감지되었고, 우측은 기존 궤도가 안정적일 때
+    else if (curr_left.valid && s.conf_right >= s.cfg.minimum_confidence) {
+      left_x = calc_x_at_y(curr_left.slope, curr_left.intercept, y_ref);
+      right_x = calc_x_at_y(s.right.slope, s.right.intercept, y_ref);
+      can_check_width = true;
+    }
 
-      if (measured_width < w_min || measured_width > w_max) {
-        // 폭이 기준을 벗어나면, 과거 궤적 대비 더 많이 튄 쪽을 범인으로 간주하고 기각
-        double lx_expected = s.left.slope != 0.0 ? calc_x_at_y(s.left.slope, s.left.intercept, lookahead_y) : lx_meas;
-        double rx_expected = s.right.slope != 0.0 ? calc_x_at_y(s.right.slope, s.right.intercept, lookahead_y) : rx_meas;
-        
-        double left_shift = fabs(lx_meas - lx_expected);
-        double right_shift = fabs(rx_meas - rx_expected);
-
-        if (right_shift > left_shift) {
-          curr_right.valid = false;
-        } else {
-          curr_left.valid = false;
-        }
+    if (can_check_width) {
+      bool violates = fabs((right_x - left_x) - s.smoothed_lane_width_px) > s.cfg.lane_width_tolerance_px;
+      if (violates) {
+        if (curr_left.valid) left_violates = true;
+        if (curr_right.valid) right_violates = true;
       }
     }
 
-    // 2. 한쪽만 있을 때, 반대쪽 과거 궤적을 이용해 검사
-    if (curr_right.valid && !curr_left.valid && s.conf_left >= s.cfg.minimum_confidence && s.left.slope != 0.0) {
-      double lx_expected = calc_x_at_y(s.left.slope, s.left.intercept, lookahead_y);
-      double rx_meas = calc_x_at_y(curr_right.slope, curr_right.intercept, lookahead_y);
-      double measured_width = rx_meas - lx_expected;
-      if (measured_width < w_min || measured_width > w_max) {
-        curr_right.valid = false;
+    if (right_violates) {
+      if (s.conf_right < s.cfg.minimum_confidence) {
+        curr_right.valid = false; // 신생 라인은 즉시 기각 (깜빡임 억제)
+      } else {
+        s.right_width_violation_count++;
+        if (s.right_width_violation_count >= s.cfg.lane_width_violation_frames) curr_right.valid = false;
       }
+    } else {
+      s.right_width_violation_count = 0;
     }
 
-    if (curr_left.valid && !curr_right.valid && s.conf_right >= s.cfg.minimum_confidence && s.right.slope != 0.0) {
-      double lx_meas = calc_x_at_y(curr_left.slope, curr_left.intercept, lookahead_y);
-      double rx_expected = calc_x_at_y(s.right.slope, s.right.intercept, lookahead_y);
-      double measured_width = rx_expected - lx_meas;
-      if (measured_width < w_min || measured_width > w_max) {
-        curr_left.valid = false;
+    if (left_violates) {
+      if (s.conf_left < s.cfg.minimum_confidence) {
+        curr_left.valid = false; // 신생 라인은 즉시 기각 (깜빡임 억제)
+      } else {
+        s.left_width_violation_count++;
+        if (s.left_width_violation_count >= s.cfg.lane_width_violation_frames) curr_left.valid = false;
       }
+    } else {
+      s.left_width_violation_count = 0;
     }
   }
 
@@ -385,8 +400,13 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
     s.initialized = true;
   } else {
     if (curr_left.valid) {
-      s.left.slope = alpha * curr_left.slope + (1 - alpha) * s.left.slope;
-      s.left.intercept = alpha * curr_left.intercept + (1 - alpha) * s.left.intercept;
+      if (s.left.slope == 0.0) { // 트랩 탈출 직후 0.0과 섞여버려서 선이 영영 사라지는 치명적 버그 수정
+        s.left.slope = curr_left.slope;
+        s.left.intercept = curr_left.intercept;
+      } else if (!left_violates) { // 위반 상태면 가짜선(갈림길)이므로 섞지 않고 기존 궤도를 동결(유지)
+        s.left.slope = alpha * curr_left.slope + (1 - alpha) * s.left.slope;
+        s.left.intercept = alpha * curr_left.intercept + (1 - alpha) * s.left.intercept;
+      }
       s.conf_left = std::min(1.0, s.conf_left + 0.2);
       s.left_coast_count = 0;
     } else if (s.left_coast_count < MAX_COAST_FRAMES) {
@@ -394,11 +414,17 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
       s.conf_left = std::max(0.0, s.conf_left - 0.04);
     } else {
       s.conf_left = std::max(0.0, s.conf_left - 0.15);
+      if (s.conf_left <= 0.0) s.left.slope = 0.0; // 신뢰도가 바닥나면 궤도를 초기화하여 갈림길 고착(Trap) 방지
     }
 
     if (curr_right.valid) {
-      s.right.slope = alpha * curr_right.slope + (1 - alpha) * s.right.slope;
-      s.right.intercept = alpha * curr_right.intercept + (1 - alpha) * s.right.intercept;
+      if (s.right.slope == 0.0) { // 트랩 탈출 직후 0.0과 섞여버려서 선이 영영 사라지는 치명적 버그 수정
+        s.right.slope = curr_right.slope;
+        s.right.intercept = curr_right.intercept;
+      } else if (!right_violates) { // 위반 상태면 가짜선(갈림길)이므로 섞지 않고 기존 궤도를 동결(유지)
+        s.right.slope = alpha * curr_right.slope + (1 - alpha) * s.right.slope;
+        s.right.intercept = alpha * curr_right.intercept + (1 - alpha) * s.right.intercept;
+      }
       s.conf_right = std::min(1.0, s.conf_right + 0.2);
       s.right_coast_count = 0;
     } else if (s.right_coast_count < MAX_COAST_FRAMES) {
@@ -406,36 +432,13 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
       s.conf_right = std::max(0.0, s.conf_right - 0.04);
     } else {
       s.conf_right = std::max(0.0, s.conf_right - 0.15);
+      if (s.conf_right <= 0.0) s.right.slope = 0.0; // 신뢰도가 바닥나면 궤도를 초기화하여 갈림길 고착(Trap) 방지
     }
   }
 
-  // ── 기준 폭 학습 (두 차선 모두 안정적일 때만 EMA 업데이트) ──
-  // 신뢰도가 높고 두 차선이 모두 유효한 프레임에서만 폭을 학습해
-  // 노이즈가 심한 구간에서 기준값이 오염되는 것을 방지함
-  const double confidence_threshold_for_learning = 0.7;
-  if (s.conf_left >= confidence_threshold_for_learning &&
-      s.conf_right >= confidence_threshold_for_learning &&
-      s.left.slope != 0.0 && s.right.slope != 0.0) {
-    double lx = calc_x_at_y(s.left.slope, s.left.intercept, lookahead_y);
-    double rx = calc_x_at_y(s.right.slope, s.right.intercept, lookahead_y);
-    double current_width = rx - lx;
-    if (current_width > 50.0) { // 물리적으로 말이 안 되는 너무 좁은 폭은 학습 제외
-      if (!s.lane_width_ready) {
-        s.smoothed_lane_width = current_width; // 첫 번째 유효한 폭으로 초기화
-        s.lane_width_ready = true;
-        printf("[WidthFilter] ★ 기준 폭 초기화: %.1fpx (±%.0f%% = [%.1f, %.1f])\n",
-               s.smoothed_lane_width, tol * 100,
-               s.smoothed_lane_width * (1.0 - tol), s.smoothed_lane_width * (1.0 + tol));
-      } else {
-        // 분기/합류 차선이 서서히 벌어지는 경우 EMA가 오염되는 것을 방지하기 위해,
-        // 현재 측정된 폭이 기준 폭의 ±10% 이내일 때만 기준 폭을 업데이트합니다.
-        if (fabs(current_width - s.smoothed_lane_width) < s.smoothed_lane_width * 0.10) {
-          s.smoothed_lane_width = 0.05 * current_width + 0.95 * s.smoothed_lane_width;
-        } else {
-          // 기준 폭과 너무 차이나는 폭은 오검출(분기차선 등)로 간주하고 학습 안함
-        }
-      }
-    }
+  // 양쪽 선이 모두 죽었다면, 도로 환경이 아예 바뀌었을 수 있으므로 기존 차선 폭 기준도 초기화
+  if (s.conf_left <= 0.0 && s.conf_right <= 0.0) {
+    s.smoothed_lane_width_px = -1.0;
   }
 
   LaneResult result;
@@ -448,6 +451,19 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
   result.conf_left = s.conf_left;
   result.conf_right = s.conf_right;
   result.status_label = s.mode_label();
+
+  // 양쪽 다 신뢰도 높게 잡히고 있을 때만, 아주 천천히(alpha=0.02) "평소
+  // 차선폭"을 갱신. 느리게 갱신해야 순간적인 노이즈에 안 흔들리고, 그래야
+  // 위의 폭 일관성 검사가 "새로 생긴 차선"을 안정적으로 걸러낼 수 있음.
+  if (result.left_valid && result.right_valid &&
+      s.left_width_violation_count == 0 && s.right_width_violation_count == 0) {
+    double left_x = calc_x_at_y(s.left.slope, s.left.intercept, y_ref);
+    double right_x = calc_x_at_y(s.right.slope, s.right.intercept, y_ref);
+    double width = right_x - left_x;
+    if (s.smoothed_lane_width_px < 0) s.smoothed_lane_width_px = width;
+    else s.smoothed_lane_width_px = 0.02 * width + 0.98 * s.smoothed_lane_width_px;
+  }
+
   return result;
 }
 
