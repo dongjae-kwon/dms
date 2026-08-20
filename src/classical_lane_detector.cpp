@@ -24,6 +24,7 @@ struct LaneConfig {
   double max_color_blob_area_px = 6000.0; // 노면 눈부심, 거대한 횡단보도 등 노이즈 제거용 (이제 실제 작동함)
   double lane_width_tolerance_px = 80.0; // 한쪽 차선(빨간선)이 초반부터 죽지 않도록 여유 있게 80으로 완화
   int lane_width_violation_frames = 5; // 깜빡임 방지를 위해 다시 5프레임으로 원복
+  double max_slope_change_rate = 0.15; // 기존 추적 slope 대비 허용 변화율 (합류/분기 새 차선 세그먼트 거부용)
 };
 
 double calc_x_at_y(double slope, double intercept, double y) {
@@ -104,6 +105,10 @@ bool load_config(const char *filepath, LaneConfig *config) {
   cJSON *width_viol = cJSON_GetObjectItem(json, "lane_width_violation_frames");
   if (width_viol && cJSON_IsNumber(width_viol))
     config->lane_width_violation_frames = width_viol->valueint;
+
+  cJSON *slope_rate = cJSON_GetObjectItem(json, "max_slope_change_rate");
+  if (slope_rate && cJSON_IsNumber(slope_rate))
+    config->max_slope_change_rate = slope_rate->valuedouble;
 
   cJSON_Delete(json);
   return true;
@@ -307,12 +312,18 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
       if (s.initialized && s.left.slope != 0.0) {
         double expected_x = calc_x_at_y(s.left.slope, s.left.intercept, mid_y);
         if (fabs(mid_x - expected_x) > s.cfg.max_track_deviation_px) continue;
+        // 기울기 급변 필터: 합류/분기 새 차선은 기존 차선과 slope가 크게 다름
+        double slope_ratio = fabs(m - s.left.slope) / fabs(s.left.slope);
+        if (slope_ratio > s.cfg.max_slope_change_rate) continue;
       }
       left_m_sum += m * len; left_b_sum += b * len; left_len_sum += len;
     } else if (m > 0 && x1 > width * 0.45 && x2 > width * 0.45) {
       if (s.initialized && s.right.slope != 0.0) {
         double expected_x = calc_x_at_y(s.right.slope, s.right.intercept, mid_y);
         if (fabs(mid_x - expected_x) > s.cfg.max_track_deviation_px) continue;
+        // 기울기 급변 필터: 합류/분기 새 차선은 기존 차선과 slope가 크게 다름
+        double slope_ratio = fabs(m - s.right.slope) / fabs(s.right.slope);
+        if (slope_ratio > s.cfg.max_slope_change_rate) continue;
       }
       right_m_sum += m * len; right_b_sum += b * len; right_len_sum += len;
     }
@@ -360,10 +371,21 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
     }
 
     if (can_check_width) {
-      bool violates = fabs((right_x - left_x) - s.smoothed_lane_width_px) > s.cfg.lane_width_tolerance_px;
+      double curr_width = right_x - left_x;
+      bool violates = fabs(curr_width - s.smoothed_lane_width_px) > s.cfg.lane_width_tolerance_px;
       if (violates) {
-        if (curr_left.valid) left_violates = true;
-        if (curr_right.valid) right_violates = true;
+        // 양쪽 모두 현재 프레임에 감지되었으면, 기존 궤도에서 더 많이
+        // 벗어난(드리프트한) 쪽만 위반으로 처리 — 새 차선 쪽이 더 벗어남
+        if (curr_left.valid && curr_right.valid) {
+          double left_drift = fabs(left_x - calc_x_at_y(s.left.slope, s.left.intercept, y_ref));
+          double right_drift = fabs(right_x - calc_x_at_y(s.right.slope, s.right.intercept, y_ref));
+          if (right_drift > left_drift) right_violates = true;
+          else left_violates = true;
+        } else {
+          // 한쪽만 감지된 경우 기존 로직 유지
+          if (curr_left.valid) left_violates = true;
+          if (curr_right.valid) right_violates = true;
+        }
       }
     }
 
@@ -460,8 +482,16 @@ LaneResult ClassicalLaneDetector::detect(const cv::Mat &frame) {
     double left_x = calc_x_at_y(s.left.slope, s.left.intercept, y_ref);
     double right_x = calc_x_at_y(s.right.slope, s.right.intercept, y_ref);
     double width = right_x - left_x;
-    if (s.smoothed_lane_width_px < 0) s.smoothed_lane_width_px = width;
-    else s.smoothed_lane_width_px = 0.02 * width + 0.98 * s.smoothed_lane_width_px;
+    if (s.smoothed_lane_width_px < 0) {
+      s.smoothed_lane_width_px = width;
+    } else {
+      // 드리프트 방지: 현재 측정폭이 기준 ±(tolerance/2) 안에 있을 때만 갱신.
+      // 새 차선으로 점프 중이면 폭이 기준에서 크게 벗어나므로 기준 오염을 차단.
+      double width_diff = fabs(width - s.smoothed_lane_width_px);
+      if (width_diff < s.cfg.lane_width_tolerance_px * 0.5) {
+        s.smoothed_lane_width_px = 0.02 * width + 0.98 * s.smoothed_lane_width_px;
+      }
+    }
   }
 
   return result;

@@ -197,16 +197,24 @@ LaneResult UFLDLaneDetector::detect(const cv::Mat &frame) {
   const bool raw_right_before_filter = raw.right_valid; // 진단용: 필터링 전 원본
 
   // ── 교차/이상치 방지 ──
-  double ref_y = frame.rows * 0.9; // 하단 근처 기준점에서 좌/우 위치 비교
+  // 실제로 화면에 그려지는 범위(대략 lookahead ~ 하단)의 양 끝점에서 모두
+  // 검사. 한 지점만 보면 그 지점에서는 안 겹쳐도 다른 구간에서 넘어가는
+  // 경우를 놓칠 수 있음.
+  double ref_y_near = frame.rows * 0.65;
+  double ref_y_far = frame.rows * 0.95;
+  double ref_y = ref_y_far; // 이하 트랙 이탈(이상치) 검사에는 하단 기준점 사용
 
-  // (1) 좌측이 우측보다 오른쪽에 있으면(교차) 이번 프레임 검출 자체를 신뢰하지 않음
-  if (raw.left_valid && raw.right_valid) {
-    double lx = calc_x_at_y(raw.left_slope, raw.left_intercept, ref_y);
-    double rx = calc_x_at_y(raw.right_slope, raw.right_intercept, ref_y);
-    if (lx >= rx) {
-      raw.left_valid = false;
-      raw.right_valid = false;
-    }
+  auto crosses = [&](const RawDetection &d) {
+    double lx1 = calc_x_at_y(d.left_slope, d.left_intercept, ref_y_near);
+    double rx1 = calc_x_at_y(d.right_slope, d.right_intercept, ref_y_near);
+    double lx2 = calc_x_at_y(d.left_slope, d.left_intercept, ref_y_far);
+    double rx2 = calc_x_at_y(d.right_slope, d.right_intercept, ref_y_far);
+    return lx1 >= rx1 || lx2 >= rx2;
+  };
+
+  if (raw.left_valid && raw.right_valid && crosses(raw)) {
+    raw.left_valid = false;
+    raw.right_valid = false;
   }
 
   // (2) 트랙에 이미 신뢰도가 쌓여있으면(conf > 0), 그 위치에서 너무 멀리 튄
@@ -256,8 +264,14 @@ LaneResult UFLDLaneDetector::detect(const cv::Mat &frame) {
   }
 
   LaneResult result;
-  result.left_valid = conf_left_ >= minimum_confidence_;
-  result.right_valid = conf_right_ >= minimum_confidence_;
+  // 히스테리시스: 이미 화면에 떠있던 선은 원래 기준(minimum_confidence_)의
+  // 절반까지 떨어져야 사라지고, 새로 뜨려는 선은 원래 기준을 그대로 적용.
+  // conf가 임계값 근처에서 오르내릴 때 매 프레임 뜨고 사라지는 깜빡임을 줄임.
+  double hide_threshold = minimum_confidence_ * 0.5;
+  result.left_valid = was_left_visible_ ? (conf_left_ >= hide_threshold) : (conf_left_ >= minimum_confidence_);
+  result.right_valid = was_right_visible_ ? (conf_right_ >= hide_threshold) : (conf_right_ >= minimum_confidence_);
+  was_left_visible_ = result.left_valid;
+  was_right_visible_ = result.right_valid;
   result.left_slope = smoothed_left_slope_;
   result.left_intercept = smoothed_left_intercept_;
   result.right_slope = smoothed_right_slope_;

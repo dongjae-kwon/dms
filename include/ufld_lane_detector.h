@@ -48,6 +48,8 @@ private:
   double smoothed_right_slope_ = 0, smoothed_right_intercept_ = 0, conf_right_ = 0;
   int left_coast_count_ = 0, right_coast_count_ = 0;
   bool initialized_ = false;
+  bool was_left_visible_ = false;  // 깜빡임 방지용 히스테리시스 상태
+  bool was_right_visible_ = false;
 
   // 이번 프레임만의 raw 검출 결과 (smoothing 적용 전)
   struct RawDetection {

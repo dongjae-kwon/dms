@@ -1,0 +1,7 @@
+build/
+PINTO_model_zoo/
+*.onnx
+*.mp4
+*.avi
+.git/
+.vscode/

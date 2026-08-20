@@ -310,8 +310,13 @@ LaneResult UFLDv2LaneDetector::detect(const cv::Mat &frame) {
     initialized_ = true;
   } else {
     if (raw.left_valid) {
-      smoothed_left_slope_ = temporal_alpha_ * raw.left_slope + (1 - temporal_alpha_) * smoothed_left_slope_;
-      smoothed_left_intercept_ = temporal_alpha_ * raw.left_intercept + (1 - temporal_alpha_) * smoothed_left_intercept_;
+      if (conf_left_ <= 0.0) { // 신뢰도가 바닥난 상태에서 새로 찾았을 때 궤도 초기화 (깜빡임/Deadlock 방지)
+        smoothed_left_slope_ = raw.left_slope;
+        smoothed_left_intercept_ = raw.left_intercept;
+      } else {
+        smoothed_left_slope_ = temporal_alpha_ * raw.left_slope + (1 - temporal_alpha_) * smoothed_left_slope_;
+        smoothed_left_intercept_ = temporal_alpha_ * raw.left_intercept + (1 - temporal_alpha_) * smoothed_left_intercept_;
+      }
       conf_left_ = std::min(1.0, conf_left_ + 0.2);
       left_coast_count_ = 0;
     } else if (left_coast_count_ < max_coast_frames_) {
@@ -321,8 +326,13 @@ LaneResult UFLDv2LaneDetector::detect(const cv::Mat &frame) {
     }
 
     if (raw.right_valid) {
-      smoothed_right_slope_ = temporal_alpha_ * raw.right_slope + (1 - temporal_alpha_) * smoothed_right_slope_;
-      smoothed_right_intercept_ = temporal_alpha_ * raw.right_intercept + (1 - temporal_alpha_) * smoothed_right_intercept_;
+      if (conf_right_ <= 0.0) { // 신뢰도가 바닥난 상태에서 새로 찾았을 때 궤도 초기화 (깜빡임/Deadlock 방지)
+        smoothed_right_slope_ = raw.right_slope;
+        smoothed_right_intercept_ = raw.right_intercept;
+      } else {
+        smoothed_right_slope_ = temporal_alpha_ * raw.right_slope + (1 - temporal_alpha_) * smoothed_right_slope_;
+        smoothed_right_intercept_ = temporal_alpha_ * raw.right_intercept + (1 - temporal_alpha_) * smoothed_right_intercept_;
+      }
       conf_right_ = std::min(1.0, conf_right_ + 0.2);
       right_coast_count_ = 0;
     } else if (right_coast_count_ < max_coast_frames_) {
